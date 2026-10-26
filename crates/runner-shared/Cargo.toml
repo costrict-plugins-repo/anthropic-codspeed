@@ -1,0 +1,41 @@
+[package]
+name = "runner-shared"
+publish = false
+version = "0.1.0"
+edition = "2024"
+
+# Set by `cargo codspeed build` for the whole build; benches branch on it.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(codspeed)'] }
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_bytes = "0.11"
+serde_json = { workspace = true }
+# Pinned to 1.x: 2.0 changes the wire format and serde integration
+bincode = "1.3"
+itertools = { workspace = true }
+linux-perf-event-reader = { workspace = true }
+log = { workspace = true }
+rayon = { workspace = true }
+rmp = "0.8.15"
+rmp-serde = "1.3.1"
+libc = { workspace = true }
+zstd = "0.13.3"
+
+[dev-dependencies]
+divan = { version = "4.2.0", package = "codspeed-divan-compat" }
+memmap2 = "0.9.10"
+mimalloc = { workspace = true }
+rand = "0.8"
+tempfile = { workspace = true }
+
+[[bench]]
+name = "memtrack_writer"
+harness = false
+
+[[bench]]
+name = "memtrack_reader"
+harness = false
