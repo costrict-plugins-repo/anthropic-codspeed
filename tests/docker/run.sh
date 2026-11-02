@@ -1,0 +1,171 @@
+#!/usr/bin/env bash
+# Runs tests/executors.rs in throwaway Ubuntu containers.
+# Usage: tests/docker/run.sh [test filter and libtest args...]
+#
+# Without arguments the suite is sharded over containers, CODSPEED_TEST_SHARDS (default 4)
+# each for walltime and memory; each container has its own /tmp for the runner FIFO.
+# memtrack's uprobes are system-wide and break Valgrind, so memory starts after simulation.
+#
+# CODSPEED_VALGRIND_REF=<branch, tag or full commit sha> runs the suite against that
+# valgrind-codspeed instead of the pinned release.
+#
+# CODSPEED_VALGRIND_DEB=<path to a valgrind-codspeed .deb> runs the suite against that
+# package instead of the pinned release.
+#
+# CODSPEED_TEST_BASE_IMAGE=<image> (default ubuntu:24.04) runs the suite on that base image.
+# Each base image gets its own images and target volume: binaries built against one glibc
+# don't run on an older one.
+#
+# CODSPEED_VALGRIND_BUILD_FROM_SOURCE is forwarded to the containers when set.
+set -euo pipefail
+
+repo=$(git -C "$(dirname "$0")" rev-parse --show-toplevel)
+base_image=${CODSPEED_TEST_BASE_IMAGE:-ubuntu:24.04}
+flavor=${base_image//[^A-Za-z0-9_.-]/-}
+image=codspeed-executor-tests
+rust_version=$(sed -n 's/.*channel = "\(.*\)".*/\1/p' "$repo/rust-toolchain.toml")
+rust_components=$(sed -n 's/.*components = \[\(.*\)\].*/\1/p' "$repo/rust-toolchain.toml" | tr -d '" ')
+
+resolve_valgrind_ref() {
+  local ref=$1 refs name commit
+  if [[ $ref =~ ^[0-9a-f]{40}$ ]]; then
+    echo "$ref"
+    return
+  fi
+  refs=$(git ls-remote https://github.com/CodSpeedHQ/valgrind-codspeed.git \
+    "refs/heads/$ref" "refs/tags/$ref" "refs/tags/$ref^{}")
+  # A branch wins over a tag, and an annotated tag resolves to the commit it peels to.
+  for name in "refs/heads/$ref" "refs/tags/$ref^{}" "refs/tags/$ref"; do
+    if commit=$(awk -v name="$name" '$2 == name { print $1; found = 1 } END { exit !found }' <<<"$refs"); then
+      echo "$commit"
+      return
+    fi
+  done
+  echo "No valgrind-codspeed branch or tag named '$ref' (commits need their full sha)" >&2
+  exit 1
+}
+
+if [ -n "${CODSPEED_VALGRIND_REF:-}" ] && [ -n "${CODSPEED_VALGRIND_DEB:-}" ]; then
+  echo "Set CODSPEED_VALGRIND_REF or CODSPEED_VALGRIND_DEB, not both" >&2
+  exit 1
+fi
+
+# Arguments of setup.sh selecting the valgrind-codspeed to install, and the docker flags
+# that setup needs for it.
+valgrind_source=()
+setup_flags=()
+if [ -n "${CODSPEED_VALGRIND_REF:-}" ]; then
+  valgrind_source=(commit "$(resolve_valgrind_ref "$CODSPEED_VALGRIND_REF")")
+elif [ -n "${CODSPEED_VALGRIND_DEB:-}" ]; then
+  deb=$(realpath -e "$CODSPEED_VALGRIND_DEB")
+  valgrind_source=(deb /tmp/valgrind-codspeed.deb)
+  setup_flags=(-v "$deb":/tmp/valgrind-codspeed.deb:ro)
+fi
+
+docker build -q -t "$image:$flavor" --build-arg BASE_IMAGE="$base_image" \
+  --build-arg RUST_VERSION="$rust_version" \
+  --build-arg RUST_COMPONENTS="$rust_components" \
+  -f "$repo/tests/docker/Dockerfile" "$repo/tests/docker" >/dev/null
+
+# Caps match MEMTRACK_REQUIRED_CAPS (+ SYS_PTRACE for perf). Not --privileged: /proc/sys and
+# /sys stay read-only, so host-wide kernel knobs (THP, swap, drop_caches) can't be changed.
+# Unlimited memlock lets the unprivileged profiler mmap its perf ring buffers.
+# --init forwards Ctrl-C to cargo, which ignores it as PID 1.
+docker_flags=(
+  --init
+  --cap-add BPF --cap-add PERFMON --cap-add SYS_ADMIN --cap-add SYS_RESOURCE
+  --cap-add DAC_READ_SEARCH --cap-add SYS_PTRACE --ulimit memlock=-1:-1
+  --security-opt seccomp=unconfined --security-opt apparmor=unconfined
+  -v "$repo":/workspace
+  -v "codspeed-tests-target-$flavor":/home/tester/target
+  -v codspeed-tests-cargo:/home/tester/.cargo/registry
+  -v codspeed-tests-cargo-git:/home/tester/.cargo/git
+  -e CODSPEED_VALGRIND_BUILD_FROM_SOURCE
+)
+in_container() {
+  docker run --rm "${tty[@]}" "${docker_flags[@]}" "$run_image" "$@"
+}
+cargo_test=(cargo test -p codspeed-runner --features executor-tests --test executors)
+
+tty=()
+run_image=$image:$flavor
+in_container "${cargo_test[@]}" --no-run
+
+# Bakes what `codspeed setup` installs (Valgrind, memtrack) into an image, so test containers
+# don't reinstall it. The tag hashes the build inputs because the base image id changes on
+# every build. A stale image only costs time: tests still run setup, a no-op once the pins match.
+inputs_hash=$({
+  cat "$repo/tests/docker/Dockerfile" "$repo/tests/docker/setup.sh" "$repo/rust-toolchain.toml" \
+    "$repo/src/binary_pins.rs"
+  printf %s "$base_image ${valgrind_source[*]}"
+  if [ -n "${deb:-}" ]; then
+    cat "$deb"
+  fi
+} | sha256sum | cut -c1-12)
+run_image=$image:$flavor-setup-$inputs_hash
+if ! docker image inspect "$run_image" >/dev/null 2>&1; then
+  setup_container=$image-setup-$flavor
+  docker rm -f "$setup_container" >/dev/null 2>&1 || true
+  docker run --name "$setup_container" "${docker_flags[@]}" "${setup_flags[@]}" "$image:$flavor" \
+    tests/docker/setup.sh /home/tester/target/debug/codspeed "${valgrind_source[@]}"
+  docker commit "$setup_container" "$run_image" >/dev/null
+  docker rm "$setup_container" >/dev/null
+  docker images --filter "reference=$image:$flavor-setup-*" --format '{{.Repository}}:{{.Tag}}' \
+    | { grep -vxF "$run_image" || true; } | xargs -r docker rmi >/dev/null
+fi
+
+if [ $# -gt 0 ]; then
+  tty=(-t)
+  in_container "${cargo_test[@]}" -- "$@"
+  exit
+fi
+
+simulation=()
+memory=()
+walltime=()
+while read -r name; do
+  case $name in
+    *Simulation*) simulation+=("$name") ;;
+    *Memory* | memory_*) memory+=("$name") ;;
+    *) walltime+=("$name") ;;
+  esac
+done < <(in_container "${cargo_test[@]}" -q -- --list --format terse | sed -n 's/: test$//p')
+
+# Background jobs ignore SIGINT, so Ctrl-C has to stop them (and their containers) explicitly.
+trap 'trap - INT TERM; kill 0' INT TERM
+pids=()
+shard() {
+  local label=$1
+  shift
+  (in_container "${cargo_test[@]}" -q -- --exact "$@" 2>&1 | sed -u "s/^/[$label] /") &
+  pids+=($!)
+}
+
+# Round-robins the tests over `shards` containers.
+spread() {
+  local label=$1 i j
+  shift
+  local names=("$@")
+  for ((i = 0; i < shards; i++)); do
+    local part=()
+    for ((j = i; j < ${#names[@]}; j += shards)); do
+      part+=("${names[j]}")
+    done
+    if [ ${#part[@]} -gt 0 ]; then
+      shard "$label-$i" "${part[@]}"
+    fi
+  done
+}
+
+status=0
+shards=${CODSPEED_TEST_SHARDS:-4}
+spread walltime "${walltime[@]}"
+shard simulation "${simulation[@]}"
+wait "${pids[-1]}" || status=1
+unset 'pids[-1]'
+spread memory "${memory[@]}"
+
+for pid in "${pids[@]}"; do
+  wait "$pid" || status=1
+done
+exit $status
