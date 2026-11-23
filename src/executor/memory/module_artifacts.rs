@@ -1,0 +1,952 @@
+use crate::executor::helpers::harvest_perf_maps_for_pids::harvest_perf_maps_for_pids;
+use crate::executor::shared::module_artifacts::elf_helper;
+use crate::executor::shared::module_artifacts::loaded_module::LoadedModule;
+use crate::executor::shared::module_artifacts::module_symbols::ModuleSymbols;
+use crate::executor::shared::module_artifacts::save_artifacts::save_artifacts;
+use crate::executor::shared::module_artifacts::unwind_data::unwind_data_from_object;
+use crate::executor::wall_time::profiler::perf::jit_dump::save_symbols_and_harvest_unwind_data_for_pids;
+use crate::prelude::*;
+use libc::pid_t;
+use runner_shared::artifacts::{ArtifactExt, MemtrackArtifact, MemtrackEventKind};
+use runner_shared::metadata::MemtrackMetadata;
+use runner_shared::unwind_data::ProcessUnwindData;
+use std::collections::{HashMap, HashSet};
+use std::ops::Range;
+use std::path::{Path, PathBuf};
+
+/// One executable mapping of one file into one process, as `PERF_RECORD_MMAP2`
+/// would describe it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProcessMapping {
+    pid: pid_t,
+    /// Resolved in-kernel at mmap time, so it is correct for the mapping
+    /// process's mount namespace even if the process is already gone.
+    path: String,
+    /// Kernel `s_dev` encoding: `(major << 20) | minor`. With `ino`, proves at
+    /// analysis time that the path still names the file that was mapped.
+    dev: u64,
+    ino: u64,
+    /// Offset of the mapping's first byte in the file. In bytes, matching
+    /// `PERF_RECORD_MMAP2`'s `pgoff` and the load-bias computation.
+    file_offset: u64,
+    avma_range: Range<u64>,
+    /// CLOCK_MONOTONIC nanoseconds, the same clock the events carry. The
+    /// mapping is valid from here until a later mapping covers the range.
+    timestamp: u64,
+}
+
+/// Save the native modules memtrack mapped, per-process perf maps, and JIT
+/// unwind data needed for offline stack attribution. The keyed native and JIT
+/// files and their `memtrack.metadata` land in `profile_folder`; memtrack's
+/// event streams are read from `results_folder`.
+pub async fn save_module_artifacts(
+    profile_folder: &Path,
+    results_folder: &Path,
+    integration: (String, String),
+    bench_pids: &HashSet<pid_t>,
+) -> Result<()> {
+    let mappings = read_mappings(results_folder)?;
+    let pids = mappings
+        .iter()
+        .map(|mapping| mapping.pid)
+        .chain(bench_pids.iter().copied())
+        .collect::<HashSet<_>>();
+    if pids.is_empty() {
+        debug!("No processes recorded, skipping memtrack module artifacts");
+        return Ok(());
+    }
+
+    // Python and Node emit perf maps in /tmp; Python JIT dumps also contain
+    // unwind data needed to walk through interpreter trampolines. They only
+    // add interpreter names, so a failed harvest must not drop native artifacts.
+    if let Err(e) = harvest_perf_maps_for_pids(profile_folder, &pids).await {
+        warn!("Failed to harvest perf maps: {e:#}");
+    }
+    let jit_unwind_data = save_symbols_and_harvest_unwind_data_for_pids(profile_folder, &pids)
+        .await
+        .unwrap_or_else(|e| {
+            warn!("Failed to harvest JIT dumps: {e:#}");
+            HashMap::new()
+        });
+
+    let loaded_modules = loaded_modules_from_mappings(&mappings);
+    debug!(
+        "Extracting artifacts for {} modules from {} mappings",
+        loaded_modules.len(),
+        mappings.len()
+    );
+
+    let saved = save_artifacts(profile_folder, &loaded_modules, &jit_unwind_data);
+    MemtrackMetadata::new(integration, saved.artifacts).save_to(profile_folder)
+}
+
+fn read_mappings(results_folder: &Path) -> Result<Vec<ProcessMapping>> {
+    let suffix = format!(".{}.msgpack", MemtrackArtifact::name());
+
+    let mut mappings = Vec::new();
+    for entry in std::fs::read_dir(results_folder)?.filter_map(Result::ok) {
+        if !entry.file_name().to_string_lossy().ends_with(&suffix) {
+            continue;
+        }
+
+        let file = std::fs::File::open(entry.path())?;
+        // SAFETY: read-only mapping of an artifact memtrack finished writing
+        // before it exited; nothing writes to it while the runner reads it.
+        let artifact = unsafe { memmap2::Mmap::map(&file)? };
+        mappings.extend(
+            read_mappings_from_artifact(&artifact)
+                .with_context(|| format!("Failed to decode {:?}", entry.path()))?,
+        );
+    }
+
+    mappings.sort_unstable_by_key(|mapping| (mapping.pid, mapping.timestamp));
+    Ok(mappings)
+}
+
+/// Reconstruct mappings across forks because inherited perf events do not
+/// synthesize mappings that already existed when a child was forked.
+fn read_mappings_from_artifact(artifact: &[u8]) -> Result<Vec<ProcessMapping>> {
+    let mut timeline = MemtrackArtifact::decode_module_events(artifact)?;
+
+    // Ties break so exec purges before mapping, while fork inherits that mapping.
+    timeline.sort_by_key(|event| {
+        let rank = match &event.kind {
+            MemtrackEventKind::Exec => 0,
+            MemtrackEventKind::Mapping { .. } => 1,
+            MemtrackEventKind::Fork { .. } => 2,
+            _ => unreachable!(),
+        };
+        (event.timestamp, rank)
+    });
+
+    let mut live_mappings: HashMap<pid_t, Vec<ProcessMapping>> = HashMap::new();
+    let mut mappings = Vec::new();
+
+    for event in timeline {
+        match event.kind {
+            MemtrackEventKind::Mapping {
+                path,
+                dev,
+                ino,
+                file_offset,
+                len,
+            } => {
+                let Some(end) = event.addr.checked_add(len) else {
+                    debug!("Skipping mapping for {path}: address range overflows");
+                    continue;
+                };
+
+                let mapping = ProcessMapping {
+                    pid: event.pid,
+                    path,
+                    dev,
+                    ino,
+                    file_offset,
+                    avma_range: event.addr..end,
+                    timestamp: event.timestamp,
+                };
+                live_mappings
+                    .entry(mapping.pid)
+                    .or_default()
+                    .push(mapping.clone());
+                mappings.push(mapping);
+            }
+            MemtrackEventKind::Fork { parent_pid } => {
+                let inherited = live_mappings.get(&parent_pid).cloned().unwrap_or_default();
+                let child_mappings = inherited
+                    .into_iter()
+                    .map(|mut mapping| {
+                        mapping.pid = event.pid;
+                        mapping.timestamp = event.timestamp;
+                        mapping
+                    })
+                    .collect::<Vec<_>>();
+                mappings.extend(child_mappings.iter().cloned());
+                live_mappings.insert(event.pid, child_mappings);
+            }
+            MemtrackEventKind::Exec => {
+                live_mappings.remove(&event.pid);
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    Ok(mappings)
+}
+
+fn loaded_modules_from_mappings(mappings: &[ProcessMapping]) -> HashMap<PathBuf, LoadedModule> {
+    let mut loaded_modules = HashMap::<PathBuf, LoadedModule>::new();
+    // Open each path once and parse every artifact from that one mapping, so
+    // the identity check and the parsed bytes always refer to the same inode,
+    // even if the path is replaced during extraction.
+    let mut mapped_modules = HashMap::<PathBuf, Option<MappedModule>>::new();
+
+    for mapping in mappings {
+        let path = PathBuf::from(&mapping.path);
+        let module = mapped_modules.entry(path.clone()).or_insert_with(|| {
+            MappedModule::open(&path)
+                .inspect_err(|e| debug!("{} is no longer mappable: {e}", mapping.path))
+                .ok()
+        });
+        let Some(module) = module else {
+            continue;
+        };
+        if !names_mapped_file(mapping, module.identity) {
+            continue;
+        }
+        let object = match object::File::parse(&module.mmap[..]) {
+            Ok(object) => object,
+            Err(e) => {
+                debug!("Failed to parse {}: {e}", mapping.path);
+                continue;
+            }
+        };
+
+        let load_bias = match elf_helper::compute_load_bias(
+            &object,
+            mapping.avma_range.start,
+            mapping.avma_range.end,
+            mapping.file_offset,
+        ) {
+            Ok(load_bias) => load_bias,
+            Err(e) => {
+                debug!("Failed to compute load bias for {}: {e}", mapping.path);
+                continue;
+            }
+        };
+
+        let loaded_module = loaded_modules.entry(path.clone()).or_default();
+
+        if loaded_module.module_symbols.is_none() {
+            match ModuleSymbols::from_object(&object, &path) {
+                Ok(symbols) => loaded_module.module_symbols = Some(symbols),
+                Err(e) => debug!("Failed to load symbols for {}: {e}", mapping.path),
+            }
+        }
+
+        let process_unwind_data = if let Some(unwind_data) = &loaded_module.unwind_data {
+            Some(ProcessUnwindData {
+                timestamp: Some(mapping.timestamp),
+                avma_range: mapping.avma_range.clone(),
+                base_avma: unwind_data.base_svma.wrapping_add(load_bias),
+            })
+        } else {
+            match unwind_data_from_object(
+                &object,
+                mapping.path.clone(),
+                mapping.avma_range.start,
+                mapping.avma_range.end,
+                None,
+                load_bias,
+            ) {
+                Ok((unwind_data, mut process_unwind_data)) => {
+                    loaded_module.unwind_data = Some(unwind_data);
+                    process_unwind_data.timestamp = Some(mapping.timestamp);
+                    Some(process_unwind_data)
+                }
+                Err(e) => {
+                    debug!("Failed to load unwind data for {}: {e}", mapping.path);
+                    None
+                }
+            }
+        };
+
+        // TODO(COD-1377): Symbol placements carry no timestamp, so an address range
+        // reused by a later load still resolves against the earlier placement too.
+        let process_loaded_module = loaded_module
+            .process_loaded_modules
+            .entry(mapping.pid)
+            .or_default();
+        process_loaded_module.add_load_bias(load_bias);
+        process_loaded_module
+            .process_unwind_data
+            .extend(process_unwind_data);
+    }
+
+    loaded_modules
+}
+
+/// Whether the path still names the file that was mapped.
+///
+/// The mapping records the inode the kernel resolved the path from; a file
+/// rebuilt or replaced since then is a different inode, and reading unwind data
+/// out of it would bind eh_frame from the wrong binary to those addresses.
+///
+/// The current identity is read from a fresh mapping of the path rather than
+/// `stat`: overlayfs can report a per-layer pseudo device through `stat` while
+/// mappings carry the overlay's own device, so an unchanged file in a nested
+/// overlay would never match.
+fn names_mapped_file(mapping: &ProcessMapping, current: (u64, u64)) -> bool {
+    let recorded = (mapping.dev, mapping.ino);
+    if recorded != current {
+        debug!(
+            "{} changed since it was mapped (recorded {recorded:?}, now {current:?})",
+            mapping.path
+        );
+        return false;
+    }
+    true
+}
+
+/// A whole-file mapping of a module, with the `(dev, ino)` the kernel reports
+/// for that mapping, in the `(major << 20) | minor` encoding
+/// `PERF_RECORD_MMAP2` carries.
+struct MappedModule {
+    mmap: memmap2::Mmap,
+    identity: (u64, u64),
+}
+
+impl MappedModule {
+    fn open(path: &Path) -> Result<Self> {
+        let file = std::fs::File::open(path)?;
+        // SAFETY: read-only mapping. Replacing the path (the case checked
+        // here) creates a new inode and leaves these bytes untouched. Assumes
+        // modules are not modified or truncated in place while the runner
+        // post-processes, as the walltime unwind data extraction already does.
+        let mmap = unsafe { memmap2::Mmap::map(&file)? };
+        let identity = Self::mapped_identity(&mmap)?;
+        Ok(Self { mmap, identity })
+    }
+
+    fn mapped_identity(mmap: &memmap2::Mmap) -> Result<(u64, u64)> {
+        let start = format!("{:x}-", mmap.as_ptr() as usize);
+
+        let maps = std::fs::read_to_string("/proc/self/maps")?;
+        let line = maps
+            .lines()
+            .find(|line| line.starts_with(&start))
+            .ok_or_else(|| anyhow!("own mapping not found in /proc/self/maps"))?;
+
+        // Fields: range, perms, offset, "major:minor" in hex, inode.
+        let mut fields = line.split_ascii_whitespace().skip(3);
+        let (dev, ino) = fields
+            .next()
+            .zip(fields.next())
+            .ok_or_else(|| anyhow!("malformed maps line: {line}"))?;
+        let (major, minor) = dev
+            .split_once(':')
+            .ok_or_else(|| anyhow!("malformed device: {dev}"))?;
+        let dev = (u64::from_str_radix(major, 16)? << 20) | u64::from_str_radix(minor, 16)?;
+        Ok((dev, ino.parse()?))
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use runner_shared::artifacts::MemtrackEvent;
+
+    fn mapping_for(path: &str, dev: u64, ino: u64) -> ProcessMapping {
+        ProcessMapping {
+            pid: 42,
+            path: path.to_string(),
+            dev,
+            ino,
+            file_offset: 0,
+            avma_range: 0x1000..0x2000,
+            timestamp: 7,
+        }
+    }
+
+    /// Identity of the test binary as the kernel reports it for the mapping
+    /// that loaded it, which is what `PERF_RECORD_MMAP2` records.
+    fn recorded_identity_of_own_exe() -> (u64, u64) {
+        let exe = std::fs::read_link("/proc/self/exe").unwrap();
+        let maps = std::fs::read_to_string("/proc/self/maps").unwrap();
+        let line = maps
+            .lines()
+            .find(|line| line.ends_with(exe.to_str().unwrap()))
+            .unwrap();
+        let fields: Vec<&str> = line.split_ascii_whitespace().collect();
+        let (major, minor) = fields[3].split_once(':').unwrap();
+        let dev =
+            u64::from_str_radix(major, 16).unwrap() << 20 | u64::from_str_radix(minor, 16).unwrap();
+        (dev, fields[4].parse().unwrap())
+    }
+
+    /// Must hold on overlayfs too, where `stat` can report a different device
+    /// than mappings do for the same unchanged file.
+    #[test]
+    fn accepts_a_file_that_still_has_the_recorded_inode() {
+        let path = "/proc/self/exe";
+        let (dev, ino) = recorded_identity_of_own_exe();
+
+        assert!(names_mapped_file(
+            &mapping_for(path, dev, ino),
+            MappedModule::open(Path::new(path)).unwrap().identity
+        ));
+    }
+
+    #[test]
+    fn rejects_a_file_whose_inode_changed() {
+        let path = "/proc/self/exe";
+        let (dev, _) = recorded_identity_of_own_exe();
+
+        assert!(!names_mapped_file(
+            &mapping_for(path, dev, 0),
+            MappedModule::open(Path::new(path)).unwrap().identity
+        ));
+    }
+
+    /// Nested overlays, as in sandboxed CI runners, make `stat` report a
+    /// per-layer device that differs from the one mappings carry.
+    #[test_with::env(GITHUB_ACTIONS)]
+    #[test]
+    fn accepts_an_unchanged_file_in_a_nested_overlay() {
+        use crate::executor::helpers::run_with_sudo::run_with_sudo;
+        use std::os::unix::fs::MetadataExt;
+
+        /// Unmounts in reverse order on drop, so a failing assertion does not
+        /// leave mounts behind on the host.
+        #[derive(Default)]
+        struct Mounts(Vec<PathBuf>);
+        impl Mounts {
+            fn mount(&mut self, fstype: &str, target: &Path, options: &str) {
+                run_with_sudo(
+                    "mount",
+                    [
+                        "-t".as_ref(),
+                        fstype.as_ref(),
+                        "-o".as_ref(),
+                        options.as_ref(),
+                        fstype.as_ref(),
+                        target.as_os_str(),
+                    ],
+                )
+                .unwrap_or_else(|e| panic!("mount {fstype} on {target:?}: {e}"));
+                self.0.push(target.to_path_buf());
+            }
+        }
+        impl Drop for Mounts {
+            fn drop(&mut self) {
+                for target in self.0.iter().rev() {
+                    let _ = run_with_sudo("umount", [target]);
+                }
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let dir = |name: &str| {
+            let path = root.path().join(name);
+            std::fs::create_dir(&path).unwrap();
+            path
+        };
+        let (lower, layers, base, merged) =
+            (dir("lower"), dir("layers"), dir("base"), dir("merged"));
+        let mut mounts = Mounts::default();
+        // Owned by the test user so the module can be written without sudo.
+        let uid = nix::unistd::Uid::current();
+        mounts.mount("tmpfs", &lower, &format!("uid={uid}"));
+        mounts.mount("tmpfs", &layers, "");
+        std::fs::write(lower.join("module.so"), b"\x7fELF").unwrap();
+        let layer = |name: &str| {
+            let path = layers.join(name);
+            run_with_sudo("mkdir", [&path]).unwrap();
+            path.display().to_string()
+        };
+        let mut overlay = |name: &str, lower: &Path, target: &Path, extra: &str| {
+            let options = format!(
+                "lowerdir={},upperdir={},workdir={},userxattr{extra}",
+                lower.display(),
+                layer(&format!("{name}-upper")),
+                layer(&format!("{name}-work")),
+            );
+            mounts.mount("overlay", target, &options);
+        };
+        // The inner overlay already sets the high inode bits xino uses, so the
+        // outer one cannot encode its layer and falls back to a pseudo device.
+        overlay("base", &lower, &base, ",xino=on");
+        overlay("merged", &base, &merged, "");
+
+        let path = merged.join("module.so");
+        let stat = std::fs::metadata(&path).unwrap();
+        let stat_dev =
+            u64::from(libc::major(stat.dev())) << 20 | u64::from(libc::minor(stat.dev()));
+        let (dev, ino) = MappedModule::open(&path).unwrap().identity;
+        assert_ne!(
+            stat_dev, dev,
+            "stat agrees with the mapping, nothing to test"
+        );
+
+        let mapping = mapping_for(path.to_str().unwrap(), dev, ino);
+        assert!(names_mapped_file(&mapping, (dev, ino)));
+    }
+
+    #[test]
+    fn rejects_a_path_that_no_longer_exists() {
+        let mapping = mapping_for("/nonexistent/module.so", 1, 2);
+
+        assert!(loaded_modules_from_mappings(&[mapping]).is_empty());
+    }
+
+    #[test]
+    fn sorts_interleaved_mapping_artifacts_by_pid_and_timestamp() {
+        let results = tempfile::tempdir().unwrap();
+
+        // Separate files model records drained from different per-CPU rings.
+        MemtrackArtifact {
+            events: vec![
+                MemtrackEvent {
+                    pid: 42,
+                    tid: 42,
+                    timestamp: 20,
+                    addr: 0x2000,
+                    kind: MemtrackEventKind::Mapping {
+                        path: "second-module.so".to_string(),
+                        dev: 2,
+                        ino: 2,
+                        file_offset: 0x2000,
+                        len: 0x1000,
+                    },
+                },
+                MemtrackEvent {
+                    pid: 7,
+                    tid: 7,
+                    timestamp: 30,
+                    addr: 0x7000,
+                    kind: MemtrackEventKind::Mapping {
+                        path: "child-module.so".to_string(),
+                        dev: 3,
+                        ino: 3,
+                        file_offset: 0x3000,
+                        len: 0x1000,
+                    },
+                },
+            ],
+        }
+        .save_file_to(results.path(), "cpu1.MemtrackArtifact.msgpack")
+        .unwrap();
+        MemtrackArtifact {
+            events: vec![MemtrackEvent {
+                pid: 42,
+                tid: 42,
+                timestamp: 10,
+                addr: 0x1000,
+                kind: MemtrackEventKind::Mapping {
+                    path: "first-module.so".to_string(),
+                    dev: 1,
+                    ino: 1,
+                    file_offset: 0x1000,
+                    len: 0x1000,
+                },
+            }],
+        }
+        .save_file_to(results.path(), "cpu0.MemtrackArtifact.msgpack")
+        .unwrap();
+
+        let mappings = read_mappings(results.path()).unwrap();
+        assert_eq!(
+            mappings
+                .iter()
+                .map(|mapping| (mapping.pid, mapping.timestamp))
+                .collect::<Vec<_>>(),
+            vec![(7, 30), (42, 10), (42, 20)]
+        );
+        assert_eq!(mappings[0].path, "child-module.so");
+        assert_eq!(mappings[1].path, "first-module.so");
+        assert_eq!(mappings[2].path, "second-module.so");
+    }
+    #[test]
+    fn extracts_all_mapping_events_from_a_streamed_artifact() {
+        const FIRST_MODULE: &str = "first-module.so";
+        const SECOND_MODULE: &str = "second-module.so";
+        let artifact = MemtrackArtifact {
+            events: vec![
+                MemtrackEvent {
+                    pid: 1,
+                    tid: 1,
+                    timestamp: 10,
+                    addr: 0,
+                    kind: MemtrackEventKind::Malloc {
+                        size: 64,
+                        stack_hash: 0,
+                    },
+                },
+                MemtrackEvent {
+                    pid: 7,
+                    tid: 8,
+                    timestamp: 11,
+                    addr: 0x1000,
+                    kind: MemtrackEventKind::Mapping {
+                        path: FIRST_MODULE.to_string(),
+                        dev: 0x12_3456,
+                        ino: 0x789,
+                        file_offset: 0x5_2000,
+                        len: 0x2000,
+                    },
+                },
+                MemtrackEvent {
+                    pid: 9,
+                    tid: 10,
+                    timestamp: 12,
+                    addr: 0x4000,
+                    kind: MemtrackEventKind::Mapping {
+                        path: SECOND_MODULE.to_string(),
+                        dev: 0x65_4321,
+                        ino: 0xabc,
+                        file_offset: 0x7_000,
+                        len: 0x3000,
+                    },
+                },
+                MemtrackEvent {
+                    pid: 99,
+                    tid: 99,
+                    timestamp: 99,
+                    addr: u64::MAX,
+                    kind: MemtrackEventKind::Mapping {
+                        path: "overflow-module.so".to_string(),
+                        dev: 3,
+                        ino: 3,
+                        file_offset: 0,
+                        len: 1,
+                    },
+                },
+                MemtrackEvent {
+                    pid: 1,
+                    tid: 1,
+                    timestamp: 13,
+                    addr: 0x2000,
+                    kind: MemtrackEventKind::Free,
+                },
+            ],
+        };
+        let mut encoded = Vec::new();
+        artifact.encode_to_writer(&mut encoded).unwrap();
+
+        assert_eq!(
+            read_mappings_from_artifact(&encoded).unwrap(),
+            vec![
+                ProcessMapping {
+                    pid: 7,
+                    path: FIRST_MODULE.to_string(),
+                    dev: 0x12_3456,
+                    ino: 0x789,
+                    file_offset: 0x5_2000,
+                    avma_range: 0x1000..0x3000,
+                    timestamp: 11,
+                },
+                ProcessMapping {
+                    pid: 9,
+                    path: SECOND_MODULE.to_string(),
+                    dev: 0x65_4321,
+                    ino: 0xabc,
+                    file_offset: 0x7_000,
+                    avma_range: 0x4000..0x7000,
+                    timestamp: 12,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn writes_keyed_artifacts_and_metadata_for_a_streamed_mapping() {
+        const MODULE: &str = "testdata/perf_map/the_algorithms.bin";
+
+        let profile = tempfile::tempdir().unwrap();
+        let results = profile.path().join("results");
+        std::fs::create_dir_all(&results).unwrap();
+
+        let (dev, ino) = MappedModule::open(Path::new(MODULE)).unwrap().identity;
+        MemtrackArtifact {
+            events: vec![MemtrackEvent {
+                pid: 1234,
+                tid: 1234,
+                timestamp: 999,
+                addr: 0x5555_555a_7000,
+                kind: MemtrackEventKind::Mapping {
+                    path: MODULE.to_string(),
+                    dev,
+                    ino,
+                    file_offset: 0x5_2000,
+                    len: 0x109_000,
+                },
+            }],
+        }
+        .save_with_pid_to(&results, 1234)
+        .unwrap();
+
+        save_module_artifacts(
+            profile.path(),
+            &results,
+            ("codspeed-rust".to_string(), "4.2.0".to_string()),
+            &HashSet::new(),
+        )
+        .await
+        .unwrap();
+
+        let metadata = MemtrackMetadata::from_reader(
+            std::fs::File::open(profile.path().join("memtrack.metadata")).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(metadata.version, MemtrackMetadata::CURRENT_VERSION);
+        assert_eq!(
+            metadata.artifacts.mapped_process_module_symbols[&1234].len(),
+            1
+        );
+
+        let unwind = &metadata.artifacts.mapped_process_unwind_data_by_pid[&1234][0];
+        assert_eq!(unwind.inner.timestamp, Some(999));
+        assert!(
+            profile
+                .path()
+                .join(format!("{}.unwind_data", unwind.unwind_data_key))
+                .exists()
+        );
+        assert_eq!(
+            metadata.artifacts.path_key_to_path[&unwind.unwind_data_key],
+            PathBuf::from(MODULE)
+        );
+    }
+
+    /// Turns a `/proc/<pid>/maps` line into the mapping event memtrack records
+    /// for it.
+    fn mapping_event_from_maps_line(pid: pid_t, timestamp: u64, line: &str) -> MemtrackEvent {
+        let fields = line.split_whitespace().collect::<Vec<_>>();
+        let (start, end) = fields[0].split_once('-').unwrap();
+        let (start, end) = (
+            u64::from_str_radix(start, 16).unwrap(),
+            u64::from_str_radix(end, 16).unwrap(),
+        );
+        let (major, minor) = fields[3].split_once(':').unwrap();
+        let dev =
+            u64::from_str_radix(major, 16).unwrap() << 20 | u64::from_str_radix(minor, 16).unwrap();
+
+        MemtrackEvent {
+            pid,
+            tid: pid,
+            timestamp,
+            addr: start,
+            kind: MemtrackEventKind::Mapping {
+                path: fields[5].to_string(),
+                dev,
+                ino: fields[4].parse().unwrap(),
+                file_offset: u64::from_str_radix(fields[2], 16).unwrap(),
+                len: end - start,
+            },
+        }
+    }
+
+    /// A process can map its own binary a second time, as V8 does with its
+    /// embedded builtins. Each placement has its own load bias, and frames in
+    /// either copy must resolve.
+    #[tokio::test]
+    async fn keeps_every_placement_of_a_module_mapped_twice() {
+        let build = tempfile::tempdir().unwrap();
+        let binary = build.path().join("remapped_text");
+        let status = std::process::Command::new("gcc")
+            .args(["-O0", "-o"])
+            .arg(&binary)
+            .arg("testdata/memory/remapped_text.c")
+            .status()
+            .unwrap();
+        assert!(status.success(), "failed to compile remapped_text.c");
+
+        let output = std::process::Command::new(&binary).output().unwrap();
+        assert!(output.status.success(), "remapped_text failed");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let (maps_lines, allocate_line) = stdout.trim_end().rsplit_once('\n').unwrap();
+        let runtime_addrs = allocate_line
+            .strip_prefix("allocate ")
+            .unwrap()
+            .split(' ')
+            .map(|addr| u64::from_str_radix(addr, 16).unwrap())
+            .collect::<Vec<_>>();
+
+        const PID: pid_t = 4321;
+        let profile = tempfile::tempdir().unwrap();
+        let results = profile.path().join("results");
+        std::fs::create_dir_all(&results).unwrap();
+        MemtrackArtifact {
+            events: maps_lines
+                .lines()
+                .zip(1..)
+                .map(|(line, timestamp)| mapping_event_from_maps_line(PID, timestamp, line))
+                .collect(),
+        }
+        .save_with_pid_to(&results, PID)
+        .unwrap();
+
+        save_module_artifacts(
+            profile.path(),
+            &results,
+            ("exec-harness".to_string(), "1.0.0".to_string()),
+            &HashSet::new(),
+        )
+        .await
+        .unwrap();
+
+        let metadata = MemtrackMetadata::from_reader(
+            std::fs::File::open(profile.path().join("memtrack.metadata")).unwrap(),
+        )
+        .unwrap();
+        let artifacts = &metadata.artifacts;
+        let key = artifacts
+            .path_key_to_path
+            .iter()
+            .find_map(|(key, path)| (path == &binary).then_some(key))
+            .unwrap();
+
+        let symbols =
+            std::fs::read_to_string(profile.path().join(format!("{key}.symbols.map"))).unwrap();
+        let allocate_svma = symbols
+            .lines()
+            .find_map(|line| {
+                let fields = line.split(' ').collect::<Vec<_>>();
+                (fields[2] == "allocate").then(|| u64::from_str_radix(fields[0], 16).unwrap())
+            })
+            .unwrap();
+        let load_biases = artifacts.mapped_process_module_symbols[&PID]
+            .iter()
+            .filter(|mapped| &mapped.perf_map_key == key)
+            .map(|mapped| mapped.load_bias)
+            .collect::<Vec<_>>();
+        let unwind_ranges = artifacts.mapped_process_unwind_data_by_pid[&PID]
+            .iter()
+            .filter(|mapped| &mapped.unwind_data_key == key)
+            .map(|mapped| mapped.inner.avma_range.clone())
+            .collect::<Vec<_>>();
+
+        for addr in runtime_addrs {
+            assert!(
+                load_biases
+                    .iter()
+                    .any(|bias| addr.wrapping_sub(*bias) == allocate_svma),
+                "no load bias resolves {addr:#x} to `allocate`, got {load_biases:x?}"
+            );
+            assert!(
+                unwind_ranges.iter().any(|range| range.contains(&addr)),
+                "no unwind data covers {addr:#x}, got {unwind_ranges:x?}"
+            );
+        }
+    }
+
+    fn mapping_event(pid: pid_t, timestamp: u64, addr: u64, path: &str) -> MemtrackEvent {
+        MemtrackEvent {
+            pid,
+            tid: pid,
+            timestamp,
+            addr,
+            kind: MemtrackEventKind::Mapping {
+                path: path.to_string(),
+                dev: 1,
+                ino: 1,
+                file_offset: 0,
+                len: 0x1000,
+            },
+        }
+    }
+
+    fn fork_event(child_pid: pid_t, parent_pid: pid_t, timestamp: u64) -> MemtrackEvent {
+        MemtrackEvent {
+            pid: child_pid,
+            tid: child_pid,
+            timestamp,
+            addr: 0,
+            kind: MemtrackEventKind::Fork { parent_pid },
+        }
+    }
+
+    fn exec_event(pid: pid_t, timestamp: u64) -> MemtrackEvent {
+        MemtrackEvent {
+            pid,
+            tid: pid,
+            timestamp,
+            addr: 0,
+            kind: MemtrackEventKind::Exec,
+        }
+    }
+
+    fn decode_lifecycle(events: Vec<MemtrackEvent>) -> Vec<ProcessMapping> {
+        let artifact = MemtrackArtifact { events };
+        let mut encoded = Vec::new();
+        artifact.encode_to_writer(&mut encoded).unwrap();
+        read_mappings_from_artifact(&encoded).unwrap()
+    }
+
+    fn mapping_summary(mappings: &[ProcessMapping]) -> Vec<(pid_t, &str, u64)> {
+        mappings
+            .iter()
+            .map(|mapping| (mapping.pid, mapping.path.as_str(), mapping.timestamp))
+            .collect()
+    }
+
+    #[test]
+    fn fork_without_exec_inherits_only_mappings_before_fork() {
+        let mappings = decode_lifecycle(vec![
+            mapping_event(100, 10, 0x1000, "before-fork.so"),
+            fork_event(200, 100, 20),
+            mapping_event(100, 30, 0x2000, "after-fork.so"),
+        ]);
+
+        assert_eq!(
+            mapping_summary(&mappings),
+            vec![
+                (100, "before-fork.so", 10),
+                (200, "before-fork.so", 20),
+                (100, "after-fork.so", 30),
+            ]
+        );
+    }
+
+    #[test]
+    fn exec_stops_inheriting_parent_mappings() {
+        let mappings = decode_lifecycle(vec![
+            mapping_event(100, 10, 0x1000, "before-fork.so"),
+            fork_event(200, 100, 20),
+            exec_event(200, 30),
+            mapping_event(100, 40, 0x2000, "after-fork.so"),
+            mapping_event(200, 50, 0x3000, "after-exec.so"),
+        ]);
+
+        assert_eq!(
+            mapping_summary(&mappings),
+            vec![
+                (100, "before-fork.so", 10),
+                (200, "before-fork.so", 20),
+                (100, "after-fork.so", 40),
+                (200, "after-exec.so", 50),
+            ]
+        );
+    }
+
+    #[test]
+    fn grandchild_inherits_transitively_from_forked_child() {
+        let mappings = decode_lifecycle(vec![
+            mapping_event(100, 10, 0x1000, "root.so"),
+            fork_event(200, 100, 20),
+            mapping_event(200, 25, 0x2000, "child.so"),
+            fork_event(300, 200, 30),
+        ]);
+
+        assert_eq!(
+            mapping_summary(&mappings),
+            vec![
+                (100, "root.so", 10),
+                (200, "root.so", 20),
+                (200, "child.so", 25),
+                (300, "root.so", 30),
+                (300, "child.so", 30),
+            ]
+        );
+    }
+
+    #[test]
+    fn equal_timestamp_events_follow_exec_mapping_fork_rank() {
+        let mappings = decode_lifecycle(vec![
+            mapping_event(100, 10, 0x1000, "before-exec.so"),
+            fork_event(200, 100, 20),
+            mapping_event(100, 20, 0x2000, "after-exec.so"),
+            exec_event(100, 20),
+        ]);
+
+        assert_eq!(
+            mapping_summary(&mappings),
+            vec![
+                (100, "before-exec.so", 10),
+                (100, "after-exec.so", 20),
+                (200, "after-exec.so", 20),
+            ]
+        );
+    }
+}
